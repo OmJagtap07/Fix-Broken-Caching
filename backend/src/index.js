@@ -7,98 +7,99 @@ const prisma = new PrismaClient();
 
 app.use(cors());
 app.use(express.json());
-
-
-const cache = new Map();
+const cacheService = require('./services/cacheService');
 
 // GET /tasks
-app.get('/tasks', async (req, res) => {
+app.get('/tasks', async (req, res, next) => {
   try {
-    // BUG 2: Global cache key logic (Used for EVERYTHING)
-    const cacheKey = 'global_data_key';
+    const cacheKey = 'tasks:list';
     
-    if (cache.has(cacheKey)) {
+    if (cacheService.has(cacheKey)) {
       console.log('Serving from cache');
-      const cachedResult = cache.get(cacheKey);
-      // BUG 4: Missing await simulation -> If store promise, wait for it here
-      // But let's say the student forgets to even wait for it here or the code fails
+      const cachedResult = cacheService.get(cacheKey);
       return res.status(200).json(cachedResult);
     }
 
-    // BUG 4: Missing await (Promise stored in cache)
-    const tasksPromise = prisma.task.findMany();
-    cache.set(cacheKey, tasksPromise); 
+    const tasks = await prisma.task.findMany();
+    cacheService.set(cacheKey, tasks, 60); // cache for 60 seconds
     
-    const tasks = await tasksPromise;
     res.status(200).json(tasks);
   } catch (err) {
-    // BUG 8: Errors swallowed
-    console.log('Error fetching tasks', err);
+    next(err);
   }
 });
 
 // GET /tasks/:id
-app.get('/tasks/:id', async (req, res) => {
+app.get('/tasks/:id', async (req, res, next) => {
   const { id } = req.params;
-  const cacheKey = `task_${id}`;
+  const cacheKey = `task:${id}`;
 
   try {
-    if (cache.has(cacheKey)) {
-      // BUG 5: Null values cached permanently
-      // If we cached null, we just return it
-      return res.status(200).json(cache.get(cacheKey));
+    if (cacheService.has(cacheKey)) {
+      return res.status(200).json(cacheService.get(cacheKey));
     }
 
     const task = await prisma.task.findUnique({
       where: { id: parseInt(id) }
     });
 
-    // BUG 5: Cached even if null
-    cache.set(cacheKey, task);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    cacheService.set(cacheKey, task, 60);
     
-    // BUG 6: Wrong status codes (200 everywhere)
     res.status(200).json(task);
   } catch (err) {
-    console.log('Error fetching task', err);
+    next(err);
   }
 });
 
 // POST /tasks
-app.post('/tasks', async (req, res) => {
+app.post('/tasks', async (req, res, next) => {
   const { title, description, price } = req.body;
+  
+  if (!title || !description || price === undefined) {
+    return res.status(400).json({ message: 'Missing required fields' });
+  }
+
   try {
     const newTask = await prisma.task.create({
       data: { title, description, price: parseFloat(price) }
     });
 
-    // BUG 4: Missing await simulation - storing a promise
-    // Wait, if I use the return value it's fine. 
-    // Let's just create a messy caching logic here too
-    // Note: No invalidation of the 'all_tasks_data' key here
+    cacheService.del('tasks:list');
     
-    // BUG 6: Wrong status code (should be 201)
-    res.status(200).json(newTask);
+    res.status(201).json(newTask);
   } catch (err) {
-    console.log('Error creating task', err);
+    next(err);
   }
 });
 
 // DELETE /tasks/:id
-app.delete('/tasks/:id', async (req, res) => {
+app.delete('/tasks/:id', async (req, res, next) => {
   const { id } = req.params;
   try {
     await prisma.task.delete({
       where: { id: parseInt(id) }
     });
 
-    // BUG 1: Cache NOT invalidated after delete!
-    // The list in 'all_tasks_data' and 'task_id' still exist
+    cacheService.del('tasks:list');
+    cacheService.del(`task:${id}`);
     
-    // BUG 6: Wrong status code (should be 204 or 200 with message)
-    res.status(200).json({ message: 'Deleted' });
+    res.status(204).send();
   } catch (err) {
-    console.log('Error deleting task', err);
+    if (err.code === 'P2025') {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+    next(err);
   }
+});
+
+// Central error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Unhandled Error:', err);
+  res.status(500).json({ message: 'Internal Server Error' });
 });
 
 const PORT = 5000;
